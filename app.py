@@ -33,7 +33,6 @@ st.markdown(
     }
     .stApp { background-color: var(--paper); }
 
-    /* ---------- Header ---------- */
     .folio-header {
         display: flex;
         align-items: center;
@@ -65,7 +64,6 @@ st.markdown(
         box-shadow: 0 0 0 3px rgba(62,122,82,0.15);
     }
 
-    /* ---------- Sidebar ---------- */
     section[data-testid="stSidebar"] {
         background-color: var(--panel);
         border-right: 1px solid var(--rule);
@@ -111,7 +109,79 @@ st.markdown(
         color: var(--inkdim);
     }
 
-    /* ---------- Chat ---------- */
+    /* ---------- Uploaded file card (replaces dropzone once a file is chosen) ---------- */
+    .doc-file-card {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 0.6rem;
+        background-color: var(--panel);
+        border: 1px solid var(--rule);
+        border-radius: 8px;
+        padding: 0.7rem 0.9rem;
+        margin-top: 0.4rem;
+    }
+    .doc-file-info { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; }
+    .doc-file-name {
+        color: var(--ink) !important;
+        font-weight: 500;
+        font-size: 0.85rem;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        max-width: 180px;
+    }
+    .doc-file-size {
+        color: var(--inkdim) !important;
+        font-size: 0.72rem;
+        font-family: 'IBM Plex Mono', monospace;
+    }
+
+    /* ---------- Streamlit's native file uploader, restyled to match theme ---------- */
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] {
+        background-color: var(--panel) !important;
+        border: 1px dashed var(--rule) !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] * {
+        color: var(--ink) !important;
+    }
+    /* Only the "Browse files" button block: black background, glowing pure white text */
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button {
+        background-color: #000000 !important;
+        border: 1px solid #000000 !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button * {
+        color: #FFFFFF !important;
+        opacity: 1 !important;
+        font-weight: 700 !important;
+        text-shadow:
+            0 0 4px #FFFFFF,
+            0 0 8px #FFFFFF,
+            0 0 14px rgba(255,255,255,0.9) !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzone"] button:hover {
+        background-color: #1a1a1a !important;
+        border-color: #1a1a1a !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] span,
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderDropzoneInstructions"] small {
+        color: var(--ink) !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"],
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderFileName"] {
+        color: var(--ink) !important;
+        background-color: transparent !important;
+    }
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] * {
+        color: var(--ink) !important;
+        background-color: transparent !important;
+    }
+    /* kill the default blue highlight Streamlit/browser applies to the filename text */
+    section[data-testid="stSidebar"] [data-testid="stFileUploaderFile"] ::selection {
+        background-color: var(--accent-soft) !important;
+        color: var(--ink) !important;
+    }
+
     .chat-row {
         display: flex;
         gap: 0.6rem;
@@ -190,7 +260,6 @@ st.markdown(
         margin-bottom: 0.4rem;
     }
 
-    /* ---------- Inputs ---------- */
     .stTextInput label, .stTextArea label,
     .stTextInput label p, .stTextArea label p {
         color: var(--ink) !important;
@@ -218,7 +287,6 @@ st.markdown(
         box-shadow: 0 0 0 3px rgba(184,134,46,0.12) !important;
     }
 
-    /* ---------- Buttons ---------- */
     .stButton button, .stFormSubmitButton button {
         background-color: var(--ink);
         color: #FFFFFF;
@@ -258,6 +326,10 @@ if "thread_id" not in st.session_state:
     st.session_state.thread_id = str(uuid.uuid4())
 if "history" not in st.session_state:
     st.session_state.history = []
+if "doc_bytes" not in st.session_state:
+    st.session_state.doc_bytes = None
+if "doc_name" not in st.session_state:
+    st.session_state.doc_name = None
 
 
 def start_new_conversation():
@@ -265,24 +337,44 @@ def start_new_conversation():
     st.session_state.history = []
 
 
+def remove_document():
+    st.session_state.doc_bytes = None
+    st.session_state.doc_name = None
+
+
 with st.sidebar:
     st.markdown('<div class="sidebar-title">RAGForge</div>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="sidebar-subtitle">Point RAGForge at a local document and ask it anything. Answers are grounded strictly in what the file contains.</div>',
+        '<div class="sidebar-subtitle">Upload a document and ask it anything. Answers are grounded strictly in what the file contains.</div>',
         unsafe_allow_html=True,
     )
 
     st.markdown('<div class="sidebar-section-label">Document</div>', unsafe_allow_html=True)
-    file_path = st.text_input(
-        "Document path",
-        placeholder=r"C:\Users\you\Documents\file.pdf",
-        label_visibility="collapsed",
-    )
-    file_path = file_path.strip().strip('"').strip("'") if file_path else file_path
 
-    if file_path:
+    if st.session_state.doc_bytes is None:
+        uploaded_file = st.file_uploader("Upload PDF", type=["pdf"], label_visibility="collapsed")
+        if uploaded_file is not None:
+            st.session_state.doc_bytes = uploaded_file.getvalue()
+            st.session_state.doc_name = uploaded_file.name
+            st.rerun()
+    else:
+        size_kb = len(st.session_state.doc_bytes) / 1024
         st.markdown(
-            '<div class="doc-status-chip ready">● Document set</div>',
+            f"""
+            <div class="doc-file-card">
+                <div class="doc-file-info">
+                    <div class="doc-file-name">{st.session_state.doc_name}</div>
+                    <div class="doc-file-size">{size_kb:.1f} KB</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.button("Remove document", on_click=remove_document)
+
+    if st.session_state.doc_bytes is not None:
+        st.markdown(
+            '<div class="doc-status-chip ready">● Document uploaded</div>',
             unsafe_allow_html=True,
         )
     else:
@@ -314,7 +406,7 @@ if not st.session_state.history:
         """
         <div class="empty-state">
             <div class="empty-state-title">No questions yet</div>
-            Add a document path in the sidebar, then ask a question below to get started.
+            Upload a document in the sidebar, then ask a question below to get started.
         </div>
         """,
         unsafe_allow_html=True,
@@ -359,8 +451,8 @@ with st.form("ask_form", clear_on_submit=True):
     submitted = st.form_submit_button("Ask")
 
 if submitted:
-    if not file_path or not file_path.strip():
-        st.error("Add the document path first.")
+    if st.session_state.doc_bytes is None:
+        st.error("Upload a document first.")
     elif not question or not question.strip():
         pass
     else:
@@ -396,29 +488,26 @@ if submitted:
         try:
             response = requests.post(
                 api_endpoint,
-                json={
-                    "file_path": file_path.strip(),
+                files={"file": (st.session_state.doc_name, st.session_state.doc_bytes, "application/pdf")},
+                data={
                     "question": question.strip(),
                     "thread_id": st.session_state.thread_id,
                 },
-                stream=True,
                 timeout=120,
             )
             if response.ok:
-                for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
-                    if chunk:
-                        full_answer += chunk
-                        placeholder.markdown(
-                            f"""
-                            <div class="chat-row assistant">
-                                <div class="avatar avatar-assistant">R</div>
-                                <div class="bubble-wrap">
-                                    <div class="bubble bubble-assistant">{full_answer}</div>
-                                </div>
-                            </div>
-                            """,
-                            unsafe_allow_html=True,
-                        )
+                full_answer = response.json().get("answer", "")
+                placeholder.markdown(
+                    f"""
+                    <div class="chat-row assistant">
+                        <div class="avatar avatar-assistant">R</div>
+                        <div class="bubble-wrap">
+                            <div class="bubble bubble-assistant">{full_answer}</div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
             else:
                 full_answer = f"Request failed ({response.status_code})"
                 is_error = True
