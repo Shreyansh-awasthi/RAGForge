@@ -1,0 +1,21 @@
+# Orchestration & Stateful Agents
+langchain>=0.3.0
+langgraph>=0.1.0
+
+# Evaluation, Observability & Guardrails
+ragas>=0.2.0
+langfuse>=2.0.0
+
+# Document Processing & Data Extraction
+doctile>=0.1.0
+pypdf>=5.0.0
+
+# API Development & Model Context Protocol (MCP)
+fastapi>=0.115.0
+uvicorn>=0.30.0
+mcp>=0.1.0
+
+# Essential Additions for Production RAG
+pymilvus>=2.4.0
+rank-bm25>=0.2.2
+cohere>=5.0.0

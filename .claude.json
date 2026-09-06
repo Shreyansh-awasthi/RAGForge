@@ -1,0 +1,1 @@
+﻿{"mcpServers":{"rag-server":{"command":".venv\\Scripts\\python.exe","args":["-u","mcp_server.py"]}}}
