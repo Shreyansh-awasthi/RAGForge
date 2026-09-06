@@ -11,6 +11,8 @@ RAGForge is a retrieval-augmented generation system built to avoid the two thing
 - [Why this exists](#why-this-exists)
 - [Architecture](#architecture)
 - [What makes the retrieval good](#what-makes-the-retrieval-good)
+- [Evaluation](#evaluation)
+- [Latency & reliability controls](#latency--reliability-controls)
 - [Tech stack](#tech-stack)
 - [Getting started](#getting-started)
 - [Project structure](#project-structure)
@@ -110,6 +112,7 @@ Every run is instrumented with LangSmith — retrieval hits, rerank scores, and 
 | Frontend | Streamlit | Fast to iterate, custom-themed |
 | Integration | MCP server | Direct tool access from Claude / MCP clients |
 | Observability | LangSmith | Full pipeline tracing |
+| Evaluation | Ragas | Faithfulness, context precision/recall, answer relevancy scoring |
 
 ---
 
@@ -157,7 +160,32 @@ RAGForge/
 
 ---
 
+## Evaluation
+
+Retrieval and answer quality aren't just assumed — there's a separate evaluation script that runs the pipeline through [Ragas](https://github.com/explodinggradients/ragas) against a fixed set of question/document pairs, scoring:
+
+- **Context precision / recall** — whether the hybrid retriever + reranker are actually surfacing the right chunks
+- **Faithfulness** — whether the generated answer is actually supported by retrieved context, not hallucinated
+- **Answer relevancy** — whether the answer addresses what was actually asked
+
+This runs independently of the live API — it's a correctness check on the pipeline itself, not something that executes on every user query.
+
+---
+
+## Latency & reliability controls
+
+Every stage that could stall or slow the pipeline down has an explicit limit rather than running unbounded:
+
+- **Hard request timeout.** Each query is wrapped in `asyncio.wait_for` — if generation hangs (a stuck Groq call, a slow embedding step), the request fails cleanly with a 504 instead of hanging the connection indefinitely.
+- **Concurrency cap.** A semaphore limits how many heavy queries (embedding + retrieval + generation) run at once. Extra requests queue briefly instead of competing for RAM/CPU and slowing everything down at once.
+- **Context is trimmed before generation.** Retrieved chunks are capped (reranked down to the top 3, then truncated to a fixed character limit) before hitting the LLM — smaller prompts mean faster generation, not just cleaner answers.
+- **Rate-limit backoff with a reduced retry budget.** On a Groq 429, the retry uses a smaller `max_tokens` and a short backoff instead of resending the same expensive request and hitting the limit again immediately.
+- **Caching skips repeated work entirely.** Parsed documents, chunks, retrievers, and answers are all cached per thread (LRU-capped, not unbounded) — re-asking a question, or asking a new question against an already-processed document, skips embedding and reranking instead of redoing it from scratch.
+
+---
+
 ## Design constraints
+
 
 Deliberate limits, not oversights:
 
