@@ -1,5 +1,0 @@
-to free memory for KV cache expansion during heavy decoding workloads. It is designed for multi-tenant LLM serving
-on modern hardware with high bandwidth. It reuses GPU memory allocated for model parameters as extra space for
-KV cache, a process called “parameter remapping”. To be more specific, when the KV cache approaches the GPU’s
-memory limit, Oneiros triggers remapping to free space.
-12
