@@ -7,16 +7,14 @@ import asyncio
 import logging
 import traceback
 import inspect
+import time
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 import uvicorn
-
-try:
-    from .Rag import run_query
-except (ModuleNotFoundError, ImportError):
-    from Rag import run_query
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,6 +25,20 @@ logger = logging.getLogger("rag-api")
 logger.info("LANGSMITH_TRACING=%s", os.getenv("LANGSMITH_TRACING"))
 logger.info("LANGSMITH_PROJECT=%s", os.getenv("LANGSMITH_PROJECT"))
 logger.info("LANGSMITH_API_KEY set=%s", bool(os.getenv("LANGSMITH_API_KEY")))
+
+
+RAG_IMPORT_ERROR = None
+run_query = None
+stream_query = None
+try:
+    try:
+        from .Rag import run_query, stream_query
+    except (ModuleNotFoundError, ImportError):
+        from Rag import run_query, stream_query
+except Exception as e:
+    RAG_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+    logger.error("Failed to import Rag.py: %s", RAG_IMPORT_ERROR)
+    traceback.print_exc()
 
 app = FastAPI(title="RAG API")
 
@@ -40,11 +52,51 @@ app.add_middleware(
 REQUEST_TIMEOUT_SECONDS = 90
 MAX_FILE_SIZE_MB = 20
 UPLOAD_DIR = "uploaded_docs"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+try:
+    os.makedirs(UPLOAD_DIR, exist_ok=True)
+except Exception as e:
+    logger.error("Could not create upload directory %s: %s", UPLOAD_DIR, e)
 
 MAX_CONCURRENT_QUERIES = 3
 query_semaphore = asyncio.Semaphore(MAX_CONCURRENT_QUERIES)
 
+
+@app.middleware("http")
+async def catch_all_middleware(request: Request, call_next):
+    start = time.perf_counter()
+    try:
+        response = await call_next(request)
+        return response
+    except Exception as e:
+        logger.error("Unhandled error in middleware for %s: %s", request.url.path, e)
+        traceback.print_exc()
+        return JSONResponse(
+            status_code=500,
+            content={"detail": f"Internal error: {type(e).__name__}: {e}"},
+        )
+    finally:
+        elapsed = time.perf_counter() - start
+        logger.info("%s %s completed in %.2fs", request.method, request.url.path, elapsed)
+
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    logger.warning("Validation error on %s: %s", request.url.path, exc.errors())
+    return JSONResponse(
+        status_code=422,
+        content={"detail": "Invalid request", "errors": exc.errors()},
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    logger.info("HTTPException on %s: %s - %s", request.url.path, exc.status_code, exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error("Unhandled exception on %s: %s", request.url.path, exc)
@@ -61,10 +113,19 @@ async def query_stream(
     question: str = Form(...),
     thread_id: str = Form(...),
 ):
-    if not thread_id:
+    if RAG_IMPORT_ERROR:
+        raise HTTPException(
+            status_code=503,
+            detail=f"RAG pipeline failed to load at startup: {RAG_IMPORT_ERROR}",
+        )
+
+    if not thread_id or not thread_id.strip():
         raise HTTPException(status_code=400, detail="thread_id is required")
 
-    if not file.filename.lower().endswith(".pdf"):
+    if not question or not question.strip():
+        raise HTTPException(status_code=400, detail="question is required")
+
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Only PDF files are supported.")
 
     try:
@@ -73,6 +134,9 @@ async def query_stream(
         logger.exception("Failed to read uploaded file")
         raise HTTPException(status_code=500, detail=f"Failed to read uploaded file: {e}")
 
+    if len(contents) == 0:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
     size_mb = len(contents) / (1024 * 1024)
     if size_mb > MAX_FILE_SIZE_MB:
         raise HTTPException(
@@ -80,71 +144,69 @@ async def query_stream(
             detail=f"File too large ({size_mb:.1f}MB). Max allowed size is {MAX_FILE_SIZE_MB}MB.",
         )
 
-    if len(contents) == 0:
-        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
-
     safe_filename = f"{thread_id}_{file.filename}"
     saved_path = os.path.join(UPLOAD_DIR, safe_filename)
 
     try:
+        os.makedirs(UPLOAD_DIR, exist_ok=True)
         with open(saved_path, "wb") as f:
             f.write(contents)
+    except PermissionError as e:
+        logger.exception("Permission denied saving uploaded file")
+        raise HTTPException(status_code=500, detail=f"Permission denied saving file: {e}")
+    except OSError as e:
+        logger.exception("OS error saving uploaded file (disk full? path issue?)")
+        raise HTTPException(status_code=500, detail=f"Could not save file: {e}")
     except Exception as e:
-        logger.exception("Failed to save uploaded file")
+        logger.exception("Unexpected error saving uploaded file")
         raise HTTPException(status_code=500, detail=f"Failed to save uploaded file: {e}")
 
-    try:
-        await asyncio.wait_for(query_semaphore.acquire(), timeout=30)
-    except asyncio.TimeoutError:
-        raise HTTPException(
-            status_code=503,
-            detail="Server is busy handling other requests. Please try again shortly.",
-        )
-
+    acquired = False
     try:
         try:
-            if inspect.iscoroutinefunction(run_query):
-                coro = run_query(saved_path, question, thread_id)
-            else:
-                loop = asyncio.get_event_loop()
-                coro = loop.run_in_executor(
-                    None, run_query, saved_path, question, thread_id
-                )
+            await asyncio.wait_for(query_semaphore.acquire(), timeout=30)
+            acquired = True
+        except asyncio.TimeoutError:
+            raise HTTPException(
+                status_code=503,
+                detail="Server is busy handling other requests. Please try again shortly.",
+            )
 
+        async def token_generator():
+            nonlocal acquired
             try:
-                result = await asyncio.wait_for(coro, timeout=REQUEST_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError:
-                logger.error(
-                    "run_query timed out after %ss for thread_id=%s",
-                    REQUEST_TIMEOUT_SECONDS,
-                    thread_id,
-                )
-                raise HTTPException(
-                    status_code=504,
-                    detail=f"Query timed out after {REQUEST_TIMEOUT_SECONDS}s. Try again or check Groq API status.",
-                )
+                async for chunk in stream_query(saved_path, question, thread_id):
+                    yield chunk
+            except Exception as e:
+                logger.exception("stream_query failed for thread_id=%s", thread_id)
+                yield f"\n[Error: {type(e).__name__}: {e}]"
+            finally:
+                if acquired:
+                    query_semaphore.release()
+                    acquired = False
 
-            if not isinstance(result, dict):
-                raise ValueError(
-                    f"run_query returned {type(result).__name__}, expected dict. Got: {result!r}"
-                )
+        return StreamingResponse(token_generator(), media_type="text/plain")
 
-            return {"answer": result.get("retrieval", "")}
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.exception("run_query failed for thread_id=%s", thread_id)
-            raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-    finally:
-        query_semaphore.release()
+    except HTTPException:
+        if acquired:
+            query_semaphore.release()
+        raise
+    except Exception as e:
+        if acquired:
+            query_semaphore.release()
+        logger.exception("Unexpected error before streaming for thread_id=%s", thread_id)
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    status = "ok" if RAG_IMPORT_ERROR is None else "degraded"
+    return {
+        "status": status,
+        "rag_pipeline_loaded": RAG_IMPORT_ERROR is None,
+        "rag_import_error": RAG_IMPORT_ERROR,
+    }
 
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))

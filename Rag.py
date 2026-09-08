@@ -5,19 +5,13 @@ import os
 import shutil
 import time
 import uuid
-from typing import Annotated, Any, List, Literal, Optional, TypedDict
+from typing import Annotated, Any, List, Optional, TypedDict
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from langchain_community.document_loaders import PyPDFLoader, WebBaseLoader
-from langchain_community.embeddings import HuggingFaceBgeEmbeddings
+from langchain_community.document_loaders import PyPDFLoader
 from langchain_community.vectorstores import Chroma
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import PromptTemplate
-from langchain_core.runnables import RunnableSequence
 from langchain_groq import ChatGroq
 from flashrank import Ranker, RerankRequest
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFaceEndpoint
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langgraph.checkpoint.memory import InMemorySaver
 
@@ -27,11 +21,8 @@ try:
     from langchain.retrievers import EnsembleRetriever
 except ImportError:
     from langchain_classic.retrievers import EnsembleRetriever
-import nest_asyncio
-import uvicorn
-from pydantic import BaseModel, Field
+from pydantic import Field
 import operator
-from mcp.server.fastmcp import FastMCP
 
 # LangSmith tracing
 from langsmith import traceable
@@ -39,8 +30,6 @@ from langsmith import traceable
 load_dotenv()
 logging.getLogger("Rag.models.factories.base_factory").setLevel(logging.ERROR)
 
-# --- Debug: confirm LangSmith env vars are actually loaded ---
-# Remove these three lines once you've confirmed tracing works.
 logging.info("LANGSMITH_TRACING=%s", os.getenv("LANGSMITH_TRACING"))
 logging.info("LANGSMITH_PROJECT=%s", os.getenv("LANGSMITH_PROJECT"))
 logging.info("LANGSMITH_API_KEY set=%s", bool(os.getenv("LANGSMITH_API_KEY")))
@@ -61,15 +50,29 @@ class AgentState(TypedDict):
 MAX_OUTPUT_TOKENS = 800
 RETRY_TOKENS = 400
 
-llm = ChatGroq(
-    model="qwen/qwen3.8-27b",
-    api_key=os.getenv("GROQ_API_KEY"),
-    temperature=0.1,
-    max_tokens=MAX_OUTPUT_TOKENS,
-)
+try:
+    llm = ChatGroq(
+        model="qwen/qwen3.8-27b",
+        api_key=os.getenv("GROQ_API_KEY"),
+        temperature=0.1,
+        max_tokens=MAX_OUTPUT_TOKENS,
+    )
+except Exception as e:
+    logging.error("Failed to initialize ChatGroq: %s", e)
+    raise RuntimeError(f"Could not initialize Groq LLM (check GROQ_API_KEY and model name): {e}") from e
 
-EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-RERANKER = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
+try:
+    EMBEDDING_MODEL = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+except Exception as e:
+    logging.error("Failed to load embedding model: %s", e)
+    raise RuntimeError(f"Could not load embedding model (check network/HuggingFace access): {e}") from e
+
+try:
+    RERANKER = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
+except Exception as e:
+    logging.error("Failed to load reranker model: %s", e)
+    raise RuntimeError(f"Could not load FlashRank reranker (check network access): {e}") from e
+
 PERSIST_ROOT = "./chroma_store"
 
 NOT_RELEVANT_MESSAGE = "This question does not appear to be related to the uploaded document. Please check your document or rephrase your question."
@@ -77,8 +80,8 @@ BUSY_MESSAGE = "The AI service is currently busy. Please wait a moment and try a
 
 from collections import OrderedDict
 
-MAX_THREADS_CACHED = 20      # max distinct thread_ids kept in memory at once
-MAX_ANSWERS_CACHED = 200     # max cached (thread_id, question) answers
+MAX_THREADS_CACHED = 20     
+MAX_ANSWERS_CACHED = 200     
 
 
 def _lru_set(store: "OrderedDict", key, value, max_size: int):
@@ -93,7 +96,6 @@ def _lru_set(store: "OrderedDict", key, value, max_size: int):
 
 
 def _lru_get(store: "OrderedDict", key):
-    """Get + mark as recently used (moves key to the end)."""
     if key not in store:
         return None
     store.move_to_end(key)
@@ -104,6 +106,7 @@ DOC_CACHE: "OrderedDict" = OrderedDict()
 CHUNK_CACHE: "OrderedDict" = OrderedDict()
 RETRIEVER_STORE: "OrderedDict" = OrderedDict()
 ANSWER_CACHE: "OrderedDict" = OrderedDict()
+HISTORY_CACHE: "OrderedDict" = OrderedDict()  
 
 
 def _file_fingerprint(file_path: str) -> str:
@@ -196,8 +199,6 @@ def Embeddings(state: AgentState) -> dict:
             weights=[0.5, 0.5],
         )
 
-        # Evict oldest thread's on-disk Chroma folder too, not just the
-        # in-memory reference, so ./chroma_store doesn't grow forever.
         if len(RETRIEVER_STORE) >= MAX_THREADS_CACHED:
             oldest_thread_id, _ = next(iter(RETRIEVER_STORE.items()))
             old_dir = os.path.join(PERSIST_ROOT, oldest_thread_id)
@@ -408,4 +409,95 @@ async def run_query(file_path: str, question: str, thread_id: str | None = None)
     result = await model.ainvoke(initial_state, config=config)
     elapsed = time.perf_counter() - t0
     print(f"[thread {thread_id}] answered in {elapsed:.2f}s")
+
+    if result.get("retrieval"):
+        history_list = _lru_get(HISTORY_CACHE, thread_id) or []
+        history_list = history_list + [{"question": question, "answer": result["retrieval"]}]
+        _lru_set(HISTORY_CACHE, thread_id, history_list[-10:], MAX_THREADS_CACHED)
+
     return result
+
+
+async def stream_query(file_path: str, question: str, thread_id: str):
+    state: dict = {"thread_id": thread_id, "file_path": file_path, "question": question}
+
+    state.update(load_documents(state))
+    if state.get("docs_status") != "READY":
+        yield NOT_RELEVANT_MESSAGE if state.get("docs_status") == "FAILED" else "Could not load the document."
+        return
+
+    state.update(text_split(state))
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, lambda: state.update(Embeddings(state)))
+
+    state["history"] = _lru_get(HISTORY_CACHE, thread_id) or []
+    ctx_update = await contextualize_question(state)
+    state.update(ctx_update)
+
+    retriever_update = retriever(state)
+    state.update(retriever_update)
+
+    documents = state.get("retrieved_docs", [])
+    final_question = state.get("question", question)
+
+    cache_key = (thread_id, final_question)
+    cached_answer = _lru_get(ANSWER_CACHE, cache_key)
+    if cached_answer is not None:
+        yield cached_answer
+        return
+
+    if not documents:
+        yield NOT_RELEVANT_MESSAGE
+        return
+
+    MAX_CONTEXT_CHARS = 4000
+    content = " ".join(doc.page_content for doc in documents)[:MAX_CONTEXT_CHARS]
+
+    prompt = f"""You are an expert AI research assistant. Answer the question using STRICTLY and ONLY the information present in the context below.
+
+CRITICAL INSTRUCTIONS:
+- Broad or general questions like "what is this document about", "summarize this", "what does the document say", or similar are ALWAYS considered relevant as long as the context below has any content — treat these as a request to summarize the context provided.
+- Only respond with "{NOT_RELEVANT_MESSAGE}" if the question is truly unrelated to the context (e.g. random text, greetings like "hello" or "sorry", or asking about a topic that does not appear anywhere in the context at all).
+- If the context is relevant, only use facts explicitly present in it. Do NOT use outside knowledge, do NOT infer beyond what is written, and do NOT fabricate details.
+- If the context only partially answers the question, answer only the supported part and explicitly state what is not covered.
+- Match the length and detail of your answer to what the question actually asks for. If the user specifies a word or length limit, respect it exactly. If the question is broad, a few clear paragraphs is enough. Do not pad the answer.
+- Write the answer as clean, natural plain-text prose in well-formed paragraphs.
+- Do NOT use any markdown formatting at all: no asterisks, no bold, no italics, no bullet points, no numbered lists, no headings, no hashtags, no underscores.
+- Do not output any thinking steps, scratchpad text, or <think></think> tags. Output ONLY the final answer text.
+
+Context:
+{content}
+
+Question: {final_question}
+Answer:"""
+
+    full_answer = ""
+    try:
+        async for chunk in llm.astream(prompt, max_tokens=MAX_OUTPUT_TOKENS):
+            piece = str(chunk.content) if chunk.content else ""
+            if piece:
+                full_answer += piece
+                yield piece
+    except Exception as e:
+        if _is_rate_limit_error(e):
+            msg = BUSY_MESSAGE
+        else:
+            logging.exception("Streaming LLM call failed: %s", e)
+            msg = "Something went wrong while generating the answer. Please try again."
+        yield msg
+        full_answer = msg
+
+    full_answer = full_answer.strip()
+    if "</think>" in full_answer:
+        full_answer = full_answer.split("</think>")[-1].strip()
+    full_answer = (
+        full_answer.replace("**", "").replace("__", "")
+        .replace("###", "").replace("##", "").replace("#", "")
+    )
+
+    if full_answer:
+        _lru_set(ANSWER_CACHE, cache_key, full_answer, MAX_ANSWERS_CACHED)
+        history_list = _lru_get(HISTORY_CACHE, thread_id) or []
+        history_list = history_list + [{"question": final_question, "answer": full_answer}]
+        _lru_set(HISTORY_CACHE, thread_id, history_list[-10:], MAX_THREADS_CACHED)

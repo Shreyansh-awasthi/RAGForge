@@ -3,7 +3,10 @@ import time
 import requests
 import streamlit as st
 
-DEFAULT_ENDPOINT = "http://127.0.0.1:8000/query/stream"
+try:
+    DEFAULT_ENDPOINT = st.secrets["API_ENDPOINT"]
+except Exception:
+    DEFAULT_ENDPOINT = "http://127.0.0.1:8000/query/stream"
 
 st.set_page_config(page_title="RAGForge — Document Intelligence", page_icon=None, layout="wide")
 
@@ -493,21 +496,24 @@ if submitted:
                     "question": question.strip(),
                     "thread_id": st.session_state.thread_id,
                 },
+                stream=True,
                 timeout=120,
             )
             if response.ok:
-                full_answer = response.json().get("answer", "")
-                placeholder.markdown(
-                    f"""
-                    <div class="chat-row assistant">
-                        <div class="avatar avatar-assistant">R</div>
-                        <div class="bubble-wrap">
-                            <div class="bubble bubble-assistant">{full_answer}</div>
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+                for chunk in response.iter_content(chunk_size=None, decode_unicode=True):
+                    if chunk:
+                        full_answer += chunk
+                        placeholder.markdown(
+                            f"""
+                            <div class="chat-row assistant">
+                                <div class="avatar avatar-assistant">R</div>
+                                <div class="bubble-wrap">
+                                    <div class="bubble bubble-assistant">{full_answer}</div>
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
             else:
                 full_answer = f"Request failed ({response.status_code})"
                 is_error = True
