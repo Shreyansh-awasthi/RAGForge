@@ -2,7 +2,6 @@
 
 **Ask questions about your documents. Get answers grounded strictly in what they actually say.**
 
-RAGForge is a retrieval-augmented generation system built to avoid the two things that make most RAG demos unreliable: shallow single-method retrieval, and answers that quietly hallucinate past the source document.
 
 ---
 
